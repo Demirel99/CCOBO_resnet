@@ -1,279 +1,219 @@
-#model.py
+#train.py
 """
-Model definitions including ResNet Encoder, FPN Decoder, ASPP, and PSF Head.
-This version uses a ResNet backbone and Cross-Attention fusion for improved performance.
+Iterative Crowd Counting Model Training Script
 """
+import os
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torchvision import models
+import torch.optim as optim
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.cuda.amp import GradScaler, autocast
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+import numpy as np
+import random
 
-# Import from config
-from config import PSF_HEAD_TEMP, MODEL_INPUT_SIZE
+from config import (
+    DEVICE, SEED, TOTAL_ITERATIONS, BATCH_SIZE, LEARNING_RATE, WEIGHT_DECAY,
+    VALIDATION_INTERVAL, VALIDATION_BATCHES,
+    IMAGE_DIR_TRAIN_VAL, GT_DIR_TRAIN_VAL, OUTPUT_DIR, LOG_FILE_PATH, BEST_MODEL_PATH,
+    AUGMENTATION_SIZE, MODEL_INPUT_SIZE, GT_PSF_SIGMA
+)
+from utils import set_seed, find_and_sort_paths, split_train_val
+from dataset import generate_batch, generate_train_sample
+# --- CHANGE HERE: Import the new model ---
+from model import ResNetFPNASPP
+from losses import combined_loss 
 
-class ASPP(nn.Module):
-    """Atrous Spatial Pyramid Pooling (ASPP) module."""
-    def __init__(self, in_channels, out_channels, rates=[1, 6, 12, 18]):
-        super(ASPP, self).__init__()
-        self.convs = nn.ModuleList()
-        # 1x1 conv
-        self.convs.append(nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False))
-        # Atrous convs
-        for rate in rates[1:]:
-             self.convs.append(nn.Conv2d(in_channels, out_channels, kernel_size=3,
-                                        padding=rate, dilation=rate, bias=False))
+KL_LOSS_WEIGHT = 1.0
+BCE_LOSS_WEIGHT = 1.0 
+NEGATIVE_SAMPLE_PROB = 0.1 
 
-        # Global average pooling
-        self.global_pool = nn.Sequential(
-            nn.AdaptiveAvgPool2d((1, 1)),
-            nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
-            nn.ReLU(inplace=True) # ReLU after GAP conv
+def train():
+    print("Setting up training...")
+    set_seed(SEED)
+
+    sorted_image_paths_train_val = find_and_sort_paths(IMAGE_DIR_TRAIN_VAL, '*.jpg')
+    sorted_gt_paths_train_val = find_and_sort_paths(GT_DIR_TRAIN_VAL, '*.mat')
+    if not sorted_image_paths_train_val or not sorted_gt_paths_train_val:
+        raise FileNotFoundError("Training/Validation images or GT files not found.")
+
+    train_image_paths, train_gt_paths, val_image_paths, val_gt_paths = split_train_val(
+        sorted_image_paths_train_val, sorted_gt_paths_train_val, val_ratio=0.1, seed=SEED
+    )
+    if not train_image_paths or not val_image_paths:
+        raise ValueError("Train or validation set is empty after splitting.")
+
+    # --- CHANGE HERE: Instantiate the new model ---
+    print("Initializing ResNetFPNASPP model...")
+    model = ResNetFPNASPP().to(DEVICE)
+    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    scheduler = CosineAnnealingLR(optimizer, T_max=TOTAL_ITERATIONS, eta_min=1e-6)
+
+    use_amp = DEVICE.type == 'cuda'
+    scaler = GradScaler(enabled=use_amp)
+    if use_amp: print("Using Automatic Mixed Precision (AMP).")
+
+    best_val_loss = float('inf')
+    iterations_log = []
+    train_total_loss_log = []
+    val_total_loss_log = []
+    val_kl_loss_log = []
+    val_bce_loss_log = []
+
+    if os.path.exists(LOG_FILE_PATH):
+        try: os.remove(LOG_FILE_PATH)
+        except OSError as e: print(f"Warning: Could not remove existing log file: {e}")
+
+    print("Starting training...")
+    pbar = tqdm(range(1, TOTAL_ITERATIONS + 1), desc=f"Iteration 1/{TOTAL_ITERATIONS}", unit="iter")
+
+    train_total_loss_accum = 0.0
+    train_kl_loss_accum = 0.0
+    train_bce_loss_accum = 0.0
+    samples_in_accum = 0
+
+    for iteration in pbar:
+        model.train()
+
+        img_batch, in_psf_batch, tgt_psf_batch, confidence_target_batch = generate_batch(
+            train_image_paths, train_gt_paths, BATCH_SIZE,
+            generation_fn=generate_train_sample,
+            augment_size=AUGMENTATION_SIZE,
+            model_input_size=MODEL_INPUT_SIZE,
+            psf_sigma=GT_PSF_SIGMA,
+            negative_prob=NEGATIVE_SAMPLE_PROB,
+            skew_target_selection_to_top=False,
+            skew_patch_to_top=False 
         )
 
-        # Batch norm for each branch
-        self.bn_ops = nn.ModuleList([nn.BatchNorm2d(out_channels) for _ in range(len(self.convs) + 1)]) # +1 for GAP
+        if img_batch is None:
+            print(f"Warning: Failed to generate training batch at iteration {iteration}. Skipping.")
+            pbar.set_postfix_str("Batch gen failed, skipping")
+            if iteration % VALIDATION_INTERVAL == 0 and samples_in_accum == 0 : 
+                 print("Skipping validation due to prior training batch failure & no accumulated loss.")
+            continue
 
-        # Final 1x1 conv and dropout
-        self.project = nn.Sequential(
-            nn.Conv2d(out_channels * (len(self.convs) + 1), out_channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(out_channels), # BN after final projection
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.2) # Consider placing dropout after ReLU
-        )
+        img_batch = img_batch.to(DEVICE)
+        in_psf_batch = in_psf_batch.to(DEVICE)
+        tgt_psf_batch = tgt_psf_batch.to(DEVICE)
+        confidence_target_batch = confidence_target_batch.to(DEVICE).unsqueeze(1) 
 
-    def forward(self, x):
-        size = x.shape[2:]
-        features = []
-        # Parallel convolutions
-        for i, conv in enumerate(self.convs):
-            features.append(F.relu(self.bn_ops[i](conv(x)))) # ReLU after BN
-        # Global pooling
-        gap_feat = self.global_pool(x)
-        gap_feat = F.interpolate(gap_feat, size=size, mode='bilinear', align_corners=False)
-        features.append(self.bn_ops[-1](gap_feat)) # BN for GAP feature
+        optimizer.zero_grad()
+        with autocast(enabled=use_amp):
+            predicted_psf, predicted_confidence_logits = model(img_batch, in_psf_batch) 
+            loss, kl_loss_val, bce_loss_val = combined_loss(
+                predicted_psf, predicted_confidence_logits, 
+                tgt_psf_batch, confidence_target_batch,
+                kl_weight=KL_LOSS_WEIGHT, bce_weight=BCE_LOSS_WEIGHT
+            )
 
-        # Concatenate and project
-        x = torch.cat(features, dim=1)
-        x = self.project(x)
-        return x
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+        scheduler.step()
 
-class ResNetEncoder(nn.Module):
-    """Encodes an image using ResNet50 features at multiple scales."""
-    def __init__(self):
-        super(ResNetEncoder, self).__init__()
-        # Load a pretrained ResNet-50
-        resnet = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
+        train_total_loss_accum += loss.item() * img_batch.size(0)
+        train_kl_loss_accum += kl_loss_val.item() * img_batch.size(0)
+        train_bce_loss_accum += bce_loss_val.item() * img_batch.size(0)
+        samples_in_accum += img_batch.size(0)
         
-        # We'll capture features from different stages
-        self.layer0 = nn.Sequential(resnet.conv1, resnet.bn1, resnet.relu, resnet.maxpool) # C1 (after maxpool)
-        self.layer1 = resnet.layer1 # C2
-        self.layer2 = resnet.layer2 # C3
-        self.layer3 = resnet.layer3 # C4
-        self.layer4 = resnet.layer4 # C5
+        pbar.set_description(f"Iter {iteration}/{TOTAL_ITERATIONS} | Batch Total Loss: {loss.item():.4f}")
 
-    def forward(self, x):
-        c1 = self.layer0(x)     # out: 64 channels, stride 4
-        c2 = self.layer1(c1)    # out: 256 channels, stride 4
-        c3 = self.layer2(c2)    # out: 512 channels, stride 8
-        c4 = self.layer3(c3)    # out: 1024 channels, stride 16
-        c5 = self.layer4(c4)    # out: 2048 channels, stride 32
-        
-        return [c1, c2, c3, c4, c5]
+        if iteration % VALIDATION_INTERVAL == 0:
+            avg_train_total_loss = train_total_loss_accum / samples_in_accum if samples_in_accum > 0 else 0.0
+            avg_train_kl_loss = train_kl_loss_accum / samples_in_accum if samples_in_accum > 0 else 0.0
+            avg_train_bce_loss = train_bce_loss_accum / samples_in_accum if samples_in_accum > 0 else 0.0
+            
+            train_total_loss_log.append(avg_train_total_loss) 
 
-class CrossAttentionFusion(nn.Module):
-    """
-    Fuses image features and mask features using a cross-attention mechanism.
-    The mask features (query) attend to the image features (key, value).
-    """
-    def __init__(self, image_channels, mask_channels, output_channels):
-        super().__init__()
-        # The residual connection requires image_channels == output_channels
-        assert image_channels == output_channels, \
-            "CrossAttentionFusion with residual connection requires image_channels to be equal to output_channels."
+            rng_state = {'random': random.getstate(), 'numpy': np.random.get_state(), 'torch': torch.get_rng_state(),
+                         'cuda': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None}
 
-        self.q_conv = nn.Conv2d(mask_channels, output_channels, 1)
-        self.k_conv = nn.Conv2d(image_channels, output_channels, 1)
-        self.v_conv = nn.Conv2d(image_channels, output_channels, 1)
-        self.scale = output_channels ** -0.5
-        self.output_conv = nn.Conv2d(output_channels, output_channels, 1)
+            model.eval()
+            val_total_loss_epoch = 0.0
+            val_kl_loss_epoch = 0.0
+            val_bce_loss_epoch = 0.0
+            total_val_samples = 0
+            with torch.no_grad():
+                for i in range(VALIDATION_BATCHES):
+                    val_seed = SEED + iteration + i; set_seed(val_seed)
+                    val_img, val_in_psf, val_tgt_psf, val_conf_tgt = generate_batch(
+                        val_image_paths, val_gt_paths, BATCH_SIZE,
+                        generation_fn=generate_train_sample,
+                        augment_size=AUGMENTATION_SIZE, model_input_size=MODEL_INPUT_SIZE,
+                        psf_sigma=GT_PSF_SIGMA, negative_prob=NEGATIVE_SAMPLE_PROB,
+                        skew_target_selection_to_top=False,
+                        skew_patch_to_top=False
+                    )
+                    if val_img is None: continue
 
-    def forward(self, image_feat, mask_feat):
-        # image_feat: (B, C_img, H, W) -> e.g., C5 from ResNet
-        # mask_feat: (B, C_mask, H, W) -> from SmallPSFEncoder
-        
-        B, _, H, W = image_feat.shape
-        
-        # Project to Q, K, V
-        q = self.q_conv(mask_feat).view(B, -1, H * W)  # Query from mask
-        k = self.k_conv(image_feat).view(B, -1, H * W)  # Key from image
-        v = self.v_conv(image_feat).view(B, -1, H * W)  # Value from image
-        
-        # Attention score calculation (b, hw, c) x (b, c, hw) -> (b, hw, hw)
-        attn = torch.bmm(q.transpose(1, 2), k) * self.scale
-        attn = F.softmax(attn, dim=-1)
-        
-        # Apply attention to value (b, c, hw) x (b, hw, hw) -> (b, c, hw)
-        attended_value = torch.bmm(v, attn.transpose(1, 2))
-        
-        # Reshape and process through output conv
-        attended_value = attended_value.view(B, -1, H, W)
-        
-        # Residual connection with the original image feature
-        output = image_feat + self.output_conv(attended_value)
-        return output
+                    val_img = val_img.to(DEVICE)
+                    val_in_psf = val_in_psf.to(DEVICE)
+                    val_tgt_psf = val_tgt_psf.to(DEVICE)
+                    val_conf_tgt = val_conf_tgt.to(DEVICE).unsqueeze(1)
 
-class SmallPSFEncoder(nn.Module):
-    """Encodes the 1-channel input PSF mask."""
-    def __init__(self):
-        super(SmallPSFEncoder, self).__init__()
-        self.encoder = nn.Sequential(
-            nn.Conv2d(1, 8, kernel_size=3, padding=1), nn.ReLU(inplace=True), nn.MaxPool2d(2, 2),
-            nn.Conv2d(8, 16, kernel_size=3, padding=1), nn.ReLU(inplace=True), nn.MaxPool2d(2, 2),
-            nn.Conv2d(16, 32, kernel_size=3, padding=1), nn.ReLU(inplace=True), nn.MaxPool2d(2, 2),
-            nn.Conv2d(32, 32, kernel_size=3, padding=1), nn.ReLU(inplace=True), nn.MaxPool2d(2, 2),
-            nn.Conv2d(32, 64, kernel_size=1), nn.ReLU(inplace=True)
-        )
+                    with autocast(enabled=use_amp):
+                        val_pred_psf, val_pred_conf_logits = model(val_img, val_in_psf) 
+                        v_loss, v_kl, v_bce = combined_loss(
+                            val_pred_psf, val_pred_conf_logits, val_tgt_psf, val_conf_tgt, 
+                            kl_weight=KL_LOSS_WEIGHT, bce_weight=BCE_LOSS_WEIGHT
+                        )
+                    val_total_loss_epoch += v_loss.item() * val_img.size(0)
+                    val_kl_loss_epoch += v_kl.item() * val_img.size(0)
+                    val_bce_loss_epoch += v_bce.item() * val_img.size(0)
+                    total_val_samples += val_img.size(0)
 
-    def forward(self, x):
-        return self.encoder(x)
+            random.setstate(rng_state['random']); np.random.set_state(rng_state['numpy'])
+            torch.set_rng_state(rng_state['torch'])
+            if rng_state['cuda'] and torch.cuda.is_available(): torch.cuda.set_rng_state_all(rng_state['cuda'])
+            set_seed(SEED + iteration + VALIDATION_BATCHES + 1)
 
-class FPNDecoder(nn.Module):
-    """Feature Pyramid Network (FPN) decoder."""
-    def __init__(self, encoder_channels=[64, 128, 256, 512, 512], fpn_channels=256, out_channels=64):
-        super(FPNDecoder, self).__init__()
-        assert len(encoder_channels) == 5, "Expected 5 encoder channel numbers for C1 to C5_effective."
-        self.lateral_convs = nn.ModuleList()
-        for enc_ch in reversed(encoder_channels):
-            self.lateral_convs.append(nn.Conv2d(enc_ch, fpn_channels, kernel_size=1))
-        self.smooth_convs = nn.ModuleList()
-        for _ in range(len(encoder_channels)):
-             self.smooth_convs.append(nn.Conv2d(fpn_channels, fpn_channels, kernel_size=3, padding=1))
-        self.final_conv = nn.Conv2d(fpn_channels, out_channels, kernel_size=3, padding=1)
+            avg_val_total_loss = val_total_loss_epoch / total_val_samples if total_val_samples > 0 else float('inf')
+            avg_val_kl_loss = val_kl_loss_epoch / total_val_samples if total_val_samples > 0 else float('inf')
+            avg_val_bce_loss = val_bce_loss_epoch / total_val_samples if total_val_samples > 0 else float('inf')
 
-    def _upsample_add(self, top_down_feat, lateral_feat):
-        _, _, H, W = lateral_feat.shape
-        upsampled_feat = F.interpolate(top_down_feat, size=(H, W), mode='bilinear', align_corners=False)
-        return upsampled_feat + lateral_feat
+            iterations_log.append(iteration)
+            val_total_loss_log.append(avg_val_total_loss)
+            val_kl_loss_log.append(avg_val_kl_loss)
+            val_bce_loss_log.append(avg_val_bce_loss)
 
-    def forward(self, x_top, encoder_features_c1_c4):
-        C1, C2, C3, C4 = encoder_features_c1_c4
-        all_features = [C1, C2, C3, C4, x_top]
-        pyramid_features = []
-        p = self.lateral_convs[0](all_features[-1])
-        p = self.smooth_convs[0](p)
-        pyramid_features.append(p)
-        for i in range(1, len(self.lateral_convs)):
-            lateral_idx = len(all_features) - 1 - i
-            lateral_feat = self.lateral_convs[i](all_features[lateral_idx])
-            p_prev = pyramid_features[-1]
-            top_down_feat = self._upsample_add(p_prev, lateral_feat)
-            p = self.smooth_convs[i](top_down_feat)
-            pyramid_features.append(p)
-        p1_output = pyramid_features[-1]
-        out = F.relu(self.final_conv(p1_output))
-        return out
+            log_message = (f"Iter [{iteration}/{TOTAL_ITERATIONS}] LR: {optimizer.param_groups[0]['lr']:.2e}\n"
+                           f"  Train Total: {avg_train_total_loss:.4f} (KL: {avg_train_kl_loss:.4f}, BCE: {avg_train_bce_loss:.4f})\n"
+                           f"  Val   Total: {avg_val_total_loss:.4f} (KL: {avg_val_kl_loss:.4f}, BCE: {avg_val_bce_loss:.4f})")
+            print(f"\n{log_message}")
+            with open(LOG_FILE_PATH, "a") as log_file: log_file.write(log_message + "\n\n")
 
-class PSFHead(nn.Module):
-    """Predicts the PSF map and confidence score from the final decoder features."""
-    def __init__(self, in_channels, temperature=PSF_HEAD_TEMP):
-        super(PSFHead, self).__init__()
-        # PSF map branch
-        self.psf_branch = nn.Sequential(
-            nn.Conv2d(in_channels, in_channels // 2, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(in_channels // 2, in_channels // 4, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(in_channels // 4, 1, kernel_size=1)  # Output 1 channel (logits for PSF)
-        )
-        self.temperature = temperature
-        self.softmax = nn.Softmax(dim=-1)  # Softmax over spatial dimensions (H*W)
-        
-        # Confidence branch
-        self.confidence_branch = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),      # Global average pooling of input features 'x'
-            nn.Flatten(),
-            nn.Linear(in_channels, in_channels // 2), # Linear layer on pooled features
-            nn.ReLU(inplace=True),
-            nn.Linear(in_channels // 2, 1) # Output logits for confidence (NO SIGMOID HERE)
-        )
+            if avg_val_total_loss < best_val_loss:
+                best_val_loss = avg_val_total_loss
+                torch.save(model.state_dict(), BEST_MODEL_PATH)
+                print(f"    -> New best model saved with Val Total Loss: {best_val_loss:.4f}")
 
-    def forward(self, x):
-        # PSF Map Prediction
-        psf_logits = self.psf_branch(x) # Shape: (B, 1, H, W)
-        b, c, h, w = psf_logits.shape
-        
-        reshaped_logits = psf_logits.view(b, c, -1) 
-        if self.temperature > 1e-6: 
-            reshaped_logits = reshaped_logits / self.temperature
-        
-        psf_distribution = self.softmax(reshaped_logits) 
-        output_psf_map = psf_distribution.view(b, c, h, w) 
-        
-        # Confidence Score Prediction
-        confidence_logits = self.confidence_branch(x) # Shape: (B, 1)
-        
-        return output_psf_map, confidence_logits
+            train_total_loss_accum = 0.0; train_kl_loss_accum = 0.0; train_bce_loss_accum = 0.0
+            samples_in_accum = 0
+    
+    print("Training complete!")
+    pbar.close()
 
+    print("Generating training plots...")
+    plt.figure(figsize=(12, 8))
+    plt.plot(iterations_log, train_total_loss_log, label='Train Total Loss', alpha=0.7)
+    plt.plot(iterations_log, val_total_loss_log, label='Val Total Loss', linewidth=2)
+    plt.plot(iterations_log, val_kl_loss_log, label='Val KL Loss', linestyle=':', alpha=0.8)
+    plt.plot(iterations_log, val_bce_loss_log, label='Val BCE Loss', linestyle='--', alpha=0.8)
+    plt.title("Training and Validation Losses over Iterations")
+    plt.xlabel("Iteration")
+    plt.ylabel("Loss Value")
+    plt.legend()
+    plt.grid(True, which="both", ls="-", alpha=0.5)
+    plt.ylim(bottom=0)
+    plt.tight_layout()
+    plot_path = os.path.join(OUTPUT_DIR, "training_losses_plot.png")
+    plt.savefig(plot_path)
+    plt.close()
 
-class ResNetFPNASPP(nn.Module):
-    """
-    The main model combining a ResNet-50 Encoder, Cross-Attention Fusion, 
-    ASPP, FPN, and a dual-output PSF Head.
-    """
-    def __init__(self):
-        super(ResNetFPNASPP, self).__init__()
-        self.image_encoder = ResNetEncoder()
-        self.mask_encoder = SmallPSFEncoder()
+    print(f"Plots saved to: {OUTPUT_DIR}")
+    print(f"Log file saved to: {LOG_FILE_PATH}")
+    print(f"Best model saved to: {BEST_MODEL_PATH} (Val Total Loss: {best_val_loss:.4f})")
 
-        # Channel dimensions from ResNet-50 Encoder
-        resnet_c1_channels = 64
-        resnet_c2_channels = 256
-        resnet_c3_channels = 512
-        resnet_c4_channels = 1024
-        resnet_c5_channels = 2048
-        mask_features_channels = 64
-
-        # Fusion module combines C5 image features and mask features
-        self.fusion_c5 = CrossAttentionFusion(
-            image_channels=resnet_c5_channels,
-            mask_channels=mask_features_channels,
-            output_channels=resnet_c5_channels # Required for the residual connection
-        )
-
-        # ASPP processes the fused features and reduces channel dimension
-        aspp_out_channels = 512
-        self.aspp_c5 = ASPP(in_channels=resnet_c5_channels, out_channels=aspp_out_channels)
-        
-        # FPN decoder gets features from ResNet and the processed C5 from ASPP
-        fpn_encoder_channels = [
-            resnet_c1_channels, resnet_c2_channels, resnet_c3_channels, 
-            resnet_c4_channels, aspp_out_channels
-        ]
-        self.fpn_decoder = FPNDecoder(
-             encoder_channels=fpn_encoder_channels,
-             fpn_channels=256,
-             out_channels=64
-         )
-        self.psf_head = PSFHead(in_channels=64, temperature=PSF_HEAD_TEMP)
-
-    def forward(self, image, mask):
-        if mask.dim() == 3:
-            mask = mask.unsqueeze(1)
-
-        encoder_features = self.image_encoder(image)
-        C1, C2, C3, C4, C5 = encoder_features
-        mask_features = self.mask_encoder(mask)
-
-        # Fuse C5 and mask features using cross-attention
-        fused_c5 = self.fusion_c5(C5, mask_features)
-        
-        # Process fused features through ASPP
-        aspp_output = self.aspp_c5(fused_c5)
-        
-        # Decode using FPN
-        decoder_output = self.fpn_decoder(aspp_output, [C1, C2, C3, C4])
-        
-        # Predict final map and confidence
-        predicted_psf_map, confidence_score = self.psf_head(decoder_output)
-
-        return predicted_psf_map, confidence_score
+if __name__ == "__main__":
+    train()
