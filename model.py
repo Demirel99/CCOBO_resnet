@@ -1,6 +1,7 @@
 #model.py
 """
-Model definitions including VGG19 Encoder, FPN Decoder, ASPP, and PSF Head.
+Model definitions including ResNet Encoder, FPN Decoder, ASPP, and PSF Head.
+This version uses a ResNet backbone and Cross-Attention fusion for improved performance.
 """
 import torch
 import torch.nn as nn
@@ -56,26 +57,70 @@ class ASPP(nn.Module):
         x = self.project(x)
         return x
 
-class VGG19Encoder(nn.Module):
-    """Encodes an image using VGG19 features at multiple scales."""
+class ResNetEncoder(nn.Module):
+    """Encodes an image using ResNet50 features at multiple scales."""
     def __init__(self):
-        super(VGG19Encoder, self).__init__()
-        vgg19 = models.vgg19(weights=models.VGG19_Weights.DEFAULT)
-        features = list(vgg19.features)
-        self.feature_layers = nn.ModuleList(features)
-        self.capture_indices = {3, 8, 17, 26, 35}
+        super(ResNetEncoder, self).__init__()
+        # Load a pretrained ResNet-50
+        resnet = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
+        
+        # We'll capture features from different stages
+        self.layer0 = nn.Sequential(resnet.conv1, resnet.bn1, resnet.relu, resnet.maxpool) # C1 (after maxpool)
+        self.layer1 = resnet.layer1 # C2
+        self.layer2 = resnet.layer2 # C3
+        self.layer3 = resnet.layer3 # C4
+        self.layer4 = resnet.layer4 # C5
 
     def forward(self, x):
-        results = {}
-        for i, layer in enumerate(self.feature_layers):
-            x = layer(x)
-            if i in self.capture_indices:
-                 if i == 3: results['C1'] = x
-                 elif i == 8: results['C2'] = x
-                 elif i == 17: results['C3'] = x
-                 elif i == 26: results['C4'] = x
-                 elif i == 35: results['C5'] = x
-        return [results['C1'], results['C2'], results['C3'], results['C4'], results['C5']]
+        c1 = self.layer0(x)     # out: 64 channels, stride 4
+        c2 = self.layer1(c1)    # out: 256 channels, stride 4
+        c3 = self.layer2(c2)    # out: 512 channels, stride 8
+        c4 = self.layer3(c3)    # out: 1024 channels, stride 16
+        c5 = self.layer4(c4)    # out: 2048 channels, stride 32
+        
+        return [c1, c2, c3, c4, c5]
+
+class CrossAttentionFusion(nn.Module):
+    """
+    Fuses image features and mask features using a cross-attention mechanism.
+    The mask features (query) attend to the image features (key, value).
+    """
+    def __init__(self, image_channels, mask_channels, output_channels):
+        super().__init__()
+        # The residual connection requires image_channels == output_channels
+        assert image_channels == output_channels, \
+            "CrossAttentionFusion with residual connection requires image_channels to be equal to output_channels."
+
+        self.q_conv = nn.Conv2d(mask_channels, output_channels, 1)
+        self.k_conv = nn.Conv2d(image_channels, output_channels, 1)
+        self.v_conv = nn.Conv2d(image_channels, output_channels, 1)
+        self.scale = output_channels ** -0.5
+        self.output_conv = nn.Conv2d(output_channels, output_channels, 1)
+
+    def forward(self, image_feat, mask_feat):
+        # image_feat: (B, C_img, H, W) -> e.g., C5 from ResNet
+        # mask_feat: (B, C_mask, H, W) -> from SmallPSFEncoder
+        
+        B, _, H, W = image_feat.shape
+        
+        # Project to Q, K, V
+        q = self.q_conv(mask_feat).view(B, -1, H * W)  # Query from mask
+        k = self.k_conv(image_feat).view(B, -1, H * W)  # Key from image
+        v = self.v_conv(image_feat).view(B, -1, H * W)  # Value from image
+        
+        # Attention score calculation (b, hw, c) x (b, c, hw) -> (b, hw, hw)
+        attn = torch.bmm(q.transpose(1, 2), k) * self.scale
+        attn = F.softmax(attn, dim=-1)
+        
+        # Apply attention to value (b, c, hw) x (b, hw, hw) -> (b, c, hw)
+        attended_value = torch.bmm(v, attn.transpose(1, 2))
+        
+        # Reshape and process through output conv
+        attended_value = attended_value.view(B, -1, H, W)
+        
+        # Residual connection with the original image feature
+        output = image_feat + self.output_conv(attended_value)
+        return output
 
 class SmallPSFEncoder(nn.Module):
     """Encodes the 1-channel input PSF mask."""
@@ -150,7 +195,6 @@ class PSFHead(nn.Module):
             nn.Linear(in_channels, in_channels // 2), # Linear layer on pooled features
             nn.ReLU(inplace=True),
             nn.Linear(in_channels // 2, 1) # Output logits for confidence (NO SIGMOID HERE)
-            # nn.Sigmoid()  # REMOVE THIS LINE
         )
 
     def forward(self, x):
@@ -166,41 +210,51 @@ class PSFHead(nn.Module):
         output_psf_map = psf_distribution.view(b, c, h, w) 
         
         # Confidence Score Prediction
-        # The confidence branch now outputs logits
         confidence_logits = self.confidence_branch(x) # Shape: (B, 1)
         
-        return output_psf_map, confidence_logits # Return logits for confidence
+        return output_psf_map, confidence_logits
 
 
-class VGG19FPNASPP(nn.Module):
-    """The main model combining VGG19, ASPP, FPN, and PSF Head."""
+class ResNetFPNASPP(nn.Module):
+    """
+    The main model combining a ResNet-50 Encoder, Cross-Attention Fusion, 
+    ASPP, FPN, and a dual-output PSF Head.
+    """
     def __init__(self):
-        super(VGG19FPNASPP, self).__init__()
-        self.image_encoder = VGG19Encoder()
+        super(ResNetFPNASPP, self).__init__()
+        self.image_encoder = ResNetEncoder()
         self.mask_encoder = SmallPSFEncoder()
 
-        vgg_c1_channels = 64
-        vgg_c2_channels = 128
-        vgg_c3_channels = 256
-        vgg_c4_channels = 512
-        vgg_c5_channels = 512
+        # Channel dimensions from ResNet-50 Encoder
+        resnet_c1_channels = 64
+        resnet_c2_channels = 256
+        resnet_c3_channels = 512
+        resnet_c4_channels = 1024
+        resnet_c5_channels = 2048
         mask_features_channels = 64
 
-        fusion_in_channels_c5 = vgg_c5_channels + mask_features_channels
-        fusion_out_channels_c5 = 512
-        self.fusion_conv_c5 = nn.Sequential(
-            nn.Conv2d(fusion_in_channels_c5, fusion_out_channels_c5, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(fusion_out_channels_c5),
-            nn.ReLU(inplace=True)
+        # Fusion module combines C5 image features and mask features
+        self.fusion_c5 = CrossAttentionFusion(
+            image_channels=resnet_c5_channels,
+            mask_channels=mask_features_channels,
+            output_channels=resnet_c5_channels # Required for the residual connection
         )
-        self.aspp_c5 = ASPP(in_channels=fusion_out_channels_c5, out_channels=fusion_out_channels_c5)
-        fpn_encoder_channels = [vgg_c1_channels, vgg_c2_channels, vgg_c3_channels, vgg_c4_channels, fusion_out_channels_c5]
+
+        # ASPP processes the fused features and reduces channel dimension
+        aspp_out_channels = 512
+        self.aspp_c5 = ASPP(in_channels=resnet_c5_channels, out_channels=aspp_out_channels)
+        
+        # FPN decoder gets features from ResNet and the processed C5 from ASPP
+        fpn_encoder_channels = [
+            resnet_c1_channels, resnet_c2_channels, resnet_c3_channels, 
+            resnet_c4_channels, aspp_out_channels
+        ]
         self.fpn_decoder = FPNDecoder(
              encoder_channels=fpn_encoder_channels,
              fpn_channels=256,
              out_channels=64
          )
-        self.psf_head = PSFHead(in_channels=64, temperature=PSF_HEAD_TEMP) # PSFHead now has two branches
+        self.psf_head = PSFHead(in_channels=64, temperature=PSF_HEAD_TEMP)
 
     def forward(self, image, mask):
         if mask.dim() == 3:
@@ -210,12 +264,16 @@ class VGG19FPNASPP(nn.Module):
         C1, C2, C3, C4, C5 = encoder_features
         mask_features = self.mask_encoder(mask)
 
-        fused_features = torch.cat([C5, mask_features], dim=1)
-        fused_c5 = self.fusion_conv_c5(fused_features)
+        # Fuse C5 and mask features using cross-attention
+        fused_c5 = self.fusion_c5(C5, mask_features)
+        
+        # Process fused features through ASPP
         aspp_output = self.aspp_c5(fused_c5)
+        
+        # Decode using FPN
         decoder_output = self.fpn_decoder(aspp_output, [C1, C2, C3, C4])
         
-        # PSFHead now returns psf_map and confidence_score
+        # Predict final map and confidence
         predicted_psf_map, confidence_score = self.psf_head(decoder_output)
 
         return predicted_psf_map, confidence_score
